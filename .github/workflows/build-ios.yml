@@ -1,0 +1,472 @@
+# Build & sign a FULL-featured Nuvio iOS IPA on GitHub Actions, then ship to TestFlight.
+#
+# "Full" flavor => P2P/torrent streaming + built-in QuickJS scrapers (not the stripped
+# App Store flavor). This requires the prebuilt Nuvio Engine Apple XCFramework, which is
+# downloaded at build time from the public nuvio-engine release (see "Stage Nuvio Engine").
+#
+# DESIGN GOALS
+#   * Public fork friendly: this workflow file is the ONLY change committed to the fork.
+#     All fork-specific values (team, bundle IDs, Supabase, signing) are injected at CI
+#     time from GitHub secrets, so `Sync fork` / `gh repo sync` never conflicts.
+#   * No memory shortcuts: gradle.properties is left at the repo's generous defaults
+#     (16 GB Kotlin/Native heap). A hosted macos-15 runner (14 GB) will likely OOM on the
+#     full flavor -- run it on a self-hosted macOS runner (e.g. an Apple-silicon Mac mini)
+#     with plenty of RAM. Pick the runner via the `runner_label` dispatch input.
+#
+# ------------------------------------------------------------------------------
+# REQUIRED GitHub secrets (Settings -> Secrets and variables -> Actions):
+#
+#   APPLE_TEAM_ID                     Your 10-char Apple Developer Team ID.
+#   BUILD_CERTIFICATE_BASE64          Base64 of your "Apple Distribution" .p12 cert.
+#                                     Create with: base64 -i Certificates.p12 | pbcopy
+#   P12_PASSWORD                      Password used when exporting the .p12.
+#   KEYCHAIN_PASSWORD                 Any random string; used only inside the runner.
+#   PROVISION_PROFILE_APP_BASE64      Base64 of the App Store profile for the app bundle ID.
+#   PROVISION_PROFILE_APP_NAME        That profile's *name* in the portal (e.g. "Nuvio AppStore").
+#   PROVISION_PROFILE_WIDGET_BASE64   Base64 of the App Store profile for the widget bundle ID.
+#   PROVISION_PROFILE_WIDGET_NAME     Widget profile's portal name.
+#   BUNDLE_ID_APP                     Your app bundle ID, e.g. "dev.aayy.nuvio".
+#   BUNDLE_ID_WIDGET                  "<BUNDLE_ID_APP>.DownloadsWidgetExtension".
+#   NUVIO_LOCAL_PROPERTIES_BASE64     Base64 of a local.properties carrying at least
+#                                     NUVIO_SUPABASE_URL / NUVIO_SUPABASE_ANON_KEY
+#                                     (and NUVIO_SUPABASE_FALLBACK_URL, TRAKT_*, etc.).
+#                                     Extract the Supabase values from the official Android
+#                                     APK (SupabaseConfig strings in classes.dex).
+#
+# REQUIRED only if upload_testflight = true:
+#   APP_STORE_CONNECT_API_KEY_ID      Key ID from App Store Connect (10 chars).
+#   APP_STORE_CONNECT_ISSUER_ID       Issuer ID (UUID) from App Store Connect.
+#   APP_STORE_CONNECT_API_KEY_BASE64  Base64 of the AuthKey_XXXXXXXX.p8 file.
+#
+# ------------------------------------------------------------------------------
+# ONE-TIME Apple Developer setup:
+#   1. Register App IDs matching BUNDLE_ID_APP and BUNDLE_ID_WIDGET. No special
+#      capabilities are needed (the widget is a Live Activity widget -- no App Group).
+#   2. Create an "Apple Distribution" certificate and export it as .p12.
+#   3. Create App Store provisioning profiles for both App IDs.
+#   4. In App Store Connect, create the app record + an API key (.p8) for uploads.
+#
+# SELF-HOSTED RUNNER prerequisites (the Mac mini):
+#   * Xcode (latest stable) + command line tools.
+#   * JDK 17 (the workflow also sets it up, but a system JDK is fine).
+#   * Android SDK / ANDROID_HOME -- the shared composeApp module configures its Android
+#     target during Gradle configuration even for the iOS task, so the SDK must resolve.
+#   * Enough RAM for a 16 GB Kotlin/Native link (16 GB is marginal; 24 GB+ recommended).
+# ------------------------------------------------------------------------------
+
+name: Build iOS IPA (full)
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner_label:
+        description: 'Runner to build on'
+        required: true
+        type: choice
+        default: 'macos-15'
+        options:
+          - macos-15
+          - self-hosted
+      export_method:
+        description: 'Xcode export method (use app-store-connect for TestFlight)'
+        required: true
+        type: choice
+        default: 'app-store-connect'
+        options:
+          - app-store-connect
+          - release-testing
+      upload_testflight:
+        description: 'Upload IPA to TestFlight after a successful build'
+        type: boolean
+        default: true
+
+concurrency:
+  group: build-ios-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Force the full distribution flavor (P2P + scrapers).
+  NUVIO_IOS_DISTRIBUTION: full
+  XCODE_VERSION: 'latest-stable'
+  # Pinned Nuvio Engine release + integrity checksum of the Apple asset.
+  NUVIO_ENGINE_VERSION: '0.1.0'
+  NUVIO_ENGINE_APPLE_SHA256: '420f9f2193ae8fae2e24fbabe28c56d49a69c4872681386d875e10dc29b64099'
+
+jobs:
+  build:
+    name: Archive & export (full)
+    runs-on: ${{ inputs.runner_label }}
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Initialize MPVKit submodule only
+        # libass-android is registered in the index but missing from .gitmodules
+        # upstream, so `submodules: recursive` fails. iOS only needs MPVKit.
+        run: git submodule update --init --recursive MPVKit
+
+      - name: Stage Nuvio Engine XCFramework
+        # The full iOS flavor needs ../nuvio-engine/platform/apple/NuvioEngine.xcframework
+        # (a sibling of the checkout, per composeApp/build.gradle.kts). Download the pinned
+        # public release, verify its checksum, and place it where Gradle expects it.
+        run: |
+          set -euo pipefail
+          ENGINE_ROOT="$GITHUB_WORKSPACE/../nuvio-engine/platform/apple"
+          ZIP="$RUNNER_TEMP/nuvio-engine-apple.zip"
+          URL="https://github.com/NuvioMedia/nuvio-engine/releases/download/v${NUVIO_ENGINE_VERSION}/nuvio-engine-apple-${NUVIO_ENGINE_VERSION}.zip"
+
+          echo "Downloading $URL"
+          curl -fL --retry 3 -o "$ZIP" "$URL"
+          echo "${NUVIO_ENGINE_APPLE_SHA256}  ${ZIP}" | shasum -a 256 -c -
+
+          rm -rf "$ENGINE_ROOT"
+          mkdir -p "$ENGINE_ROOT"
+          UNZIP_DIR="$RUNNER_TEMP/nuvio-engine-unzip"
+          rm -rf "$UNZIP_DIR"
+          unzip -q "$ZIP" -d "$UNZIP_DIR"
+          mv "$UNZIP_DIR/nuvio-engine-apple-${NUVIO_ENGINE_VERSION}/NuvioEngine.xcframework" "$ENGINE_ROOT/"
+
+          # Fail early if the exact files Gradle checks for are missing.
+          for slice in ios-arm64 ios-arm64_x86_64-simulator; do
+            test -f "$ENGINE_ROOT/NuvioEngine.xcframework/$slice/libCNuvioEngine.a"
+            test -f "$ENGINE_ROOT/NuvioEngine.xcframework/$slice/Headers/nuvio_engine/nuvio_engine.h"
+          done
+          echo "Staged NuvioEngine.xcframework at $ENGINE_ROOT"
+
+      - name: Write local.properties (Supabase / Trakt / etc.)
+        # Replaces the old empty `touch local.properties`. Gradle's generateRuntimeConfigs
+        # bakes SupabaseConfig.kt from these keys, so an empty file = broken auth/backend.
+        env:
+          NUVIO_LOCAL_PROPERTIES_BASE64: ${{ secrets.NUVIO_LOCAL_PROPERTIES_BASE64 }}
+        run: |
+          set -euo pipefail
+          if [ -z "${NUVIO_LOCAL_PROPERTIES_BASE64:-}" ]; then
+            echo "::error::NUVIO_LOCAL_PROPERTIES_BASE64 secret is not set." >&2
+            exit 1
+          fi
+          printf '%s' "$NUVIO_LOCAL_PROPERTIES_BASE64" | base64 --decode > local.properties
+
+          # sdk.dir only applies to the machine that encoded the file; let ANDROID_HOME win.
+          sed -i '' -E '/^[[:space:]]*sdk\.dir[[:space:]]*=/d' local.properties
+
+          if ! grep -Eq '^[[:space:]]*NUVIO_SUPABASE_URL[[:space:]]*=[[:space:]]*\S' local.properties; then
+            echo "::error::NUVIO_SUPABASE_URL is missing/empty in local.properties -- the build would ship broken Supabase config." >&2
+            exit 1
+          fi
+          echo "local.properties written ($(wc -l < local.properties) lines); Supabase URL present."
+
+      - name: Patch MPVKit Package.swift to use upstream prebuilt binaries
+        # The Nuvio MPVKit branch replaces 9 remote-URL binaryTargets with path-based ones
+        # expecting locally-built xcframeworks. CI doesn't build those, so swap them back to
+        # the matching upstream-main URLs + checksums.
+        run: |
+          if grep -q 'name: "Libplacebo"' MPVKit/Package.swift && \
+          grep -A2 'name: "Libplacebo"' MPVKit/Package.swift | grep -q 'path:'; then
+          python3 - <<'PY'
+          import re
+          remotes = {
+              "Libplacebo":    ("https://github.com/mpvkit/libplacebo-build/releases/download/7.360.1/Libplacebo.xcframework.zip", "2fa3d54cb81f302d6f11c7b2f509af30944381c3b11ee9d35096eb4637a6e2dd"),
+              "Libavcodec":    ("https://github.com/mpvkit/MPVKit/releases/download/0.41.0-n8.1/Libavcodec.xcframework.zip",       "22af1a028043c1953cae8cc8b9d632da8d8c733364dc896242010457e2601905"),
+              "Libavdevice":   ("https://github.com/mpvkit/MPVKit/releases/download/0.41.0-n8.1/Libavdevice.xcframework.zip",      "b1ba57380014e7680918a5f9f9d52cf91883f600ba1d53857f3720494de91c99"),
+              "Libavformat":   ("https://github.com/mpvkit/MPVKit/releases/download/0.41.0-n8.1/Libavformat.xcframework.zip",      "ded64005204d4af754273ffe11e69a91752f8a6a1c64f4540205e1666698e317"),
+              "Libavfilter":   ("https://github.com/mpvkit/MPVKit/releases/download/0.41.0-n8.1/Libavfilter.xcframework.zip",      "aedda48ffcb27e461e962af7ad7e92be736dca82943cb18dee9e4fec756b0aa4"),
+              "Libavutil":     ("https://github.com/mpvkit/MPVKit/releases/download/0.41.0-n8.1/Libavutil.xcframework.zip",        "947c31241e317e21e20e7ac0c24c467541d383b6ab88bd42acccc5947e1a674f"),
+              "Libswresample": ("https://github.com/mpvkit/MPVKit/releases/download/0.41.0-n8.1/Libswresample.xcframework.zip",    "3832feceb12606ac342dd93219ae1ca2f4bcabf037ab9299cb5b633060a34248"),
+              "Libswscale":    ("https://github.com/mpvkit/MPVKit/releases/download/0.41.0-n8.1/Libswscale.xcframework.zip",       "ed201cdae3c8e8262f3d9f3618cf3de552db47e607e39d45f93eb336ed05a075"),
+              "Libmpv":        ("https://github.com/mpvkit/MPVKit/releases/download/0.41.0-n8.1/Libmpv.xcframework.zip",           "b4d0a9ef26abd7bbf1e0a386902206deddaeae5cd36a8ab1ba638c5327389ca7"),
+          }
+          path = "MPVKit/Package.swift"
+          with open(path) as f: content = f.read()
+          for name, (url, checksum) in remotes.items():
+              pattern = re.compile(r'(\.binaryTarget\(\s*\n\s*name:\s*"' + re.escape(name) + r'",\s*\n\s*)path:\s*"[^"]*"(\s*\n\s*\))', re.MULTILINE)
+              repl = r'\1url: "' + url + '",\n            checksum: "' + checksum + r'"\2'
+              new, n = pattern.subn(repl, content)
+              if n != 1:
+                  raise SystemExit(f"FAIL: expected 1 match for {name}, got {n}")
+              print(f"  patched {name}")
+              content = new
+          with open(path, "w") as f: f.write(content)
+          PY
+          else
+            echo "MPVKit already uses remote URLs — no patching needed."
+          fi
+
+      - name: Patch signing identity into project.pbxproj
+        # Rewrite the upstream team + Release bundle IDs to your fork's values at build time,
+        # so nothing is committed to the tree. Widget line is rewritten before the app line
+        # (the app pattern is anchored on ';' so it can't clobber the widget line).
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          BUNDLE_ID_APP: ${{ secrets.BUNDLE_ID_APP }}
+          BUNDLE_ID_WIDGET: ${{ secrets.BUNDLE_ID_WIDGET }}
+        run: |
+          set -euo pipefail
+          PBXPROJ="iosApp/iosApp.xcodeproj/project.pbxproj"
+          for v in APPLE_TEAM_ID BUNDLE_ID_APP BUNDLE_ID_WIDGET; do
+            if [ -z "${!v:-}" ]; then echo "::error::$v secret is not set." >&2; exit 1; fi
+          done
+
+          sed -i '' \
+            -e "s/PRODUCT_BUNDLE_IDENTIFIER = com.nuvio.media.DownloadsWidgetExtension;/PRODUCT_BUNDLE_IDENTIFIER = ${BUNDLE_ID_WIDGET};/g" \
+            -e "s/PRODUCT_BUNDLE_IDENTIFIER = com.nuvio.media;/PRODUCT_BUNDLE_IDENTIFIER = ${BUNDLE_ID_APP};/g" \
+            -e "s/DEVELOPMENT_TEAM = 8QBDZ766S3;/DEVELOPMENT_TEAM = ${APPLE_TEAM_ID};/g" \
+            "$PBXPROJ"
+
+          echo "--- Release signing settings after patch ---"
+          grep -nE "PRODUCT_BUNDLE_IDENTIFIER = (${BUNDLE_ID_APP}|${BUNDLE_ID_WIDGET});|DEVELOPMENT_TEAM = ${APPLE_TEAM_ID};" "$PBXPROJ"
+          # The upstream identifiers must be fully gone from the Release configs.
+          if grep -q "8QBDZ766S3" "$PBXPROJ"; then
+            echo "::error::DEVELOPMENT_TEAM was not fully replaced." >&2; exit 1
+          fi
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Select Xcode ${{ env.XCODE_VERSION }}
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: ${{ env.XCODE_VERSION }}
+
+      - name: Show Xcode + iOS platform info
+        run: |
+          xcodebuild -version
+          xcodebuild -showsdks | grep -i iphoneos
+          xcrun simctl list runtimes | grep -i iOS || true
+
+      - name: Cache Gradle & Kotlin/Native
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            ~/.konan
+          key: ${{ runner.os }}-gradle-full-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties', '**/libs.versions.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-full-
+            ${{ runner.os }}-gradle-
+
+      - name: Cache SwiftPM downloads (MPVKit xcframeworks ~hundreds of MB)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/Library/Caches/org.swift.swiftpm
+            ~/Library/org.swift.swiftpm
+            ~/Library/Developer/Xcode/DerivedData/**/SourcePackages/artifacts
+          key: ${{ runner.os }}-spm-${{ hashFiles('.github/workflows/build-ios.yml', '.gitmodules') }}
+          restore-keys: |
+            ${{ runner.os }}-spm-
+
+      - name: Cache Xcode DerivedData (incremental Swift/clang artifacts)
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Developer/Xcode/DerivedData
+          key: ${{ runner.os }}-deriveddata-full-${{ hashFiles('iosApp/iosApp.xcodeproj/project.pbxproj', 'iosApp/**/*.swift') }}
+          restore-keys: |
+            ${{ runner.os }}-deriveddata-full-
+
+      - name: Resolve Swift package dependencies (MPVKit)
+        run: |
+          xcodebuild -resolvePackageDependencies \
+            -project iosApp/iosApp.xcodeproj \
+            -scheme iosApp
+
+      - name: Import signing certificate
+        env:
+          BUILD_CERTIFICATE_BASE64: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
+          P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          CERT_PATH="$RUNNER_TEMP/build_certificate.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
+          echo "SIGNING_KEYCHAIN=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+
+          printf '%s' "$BUILD_CERTIFICATE_BASE64" | base64 --decode -o "$CERT_PATH"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" \
+            -P "$P12_PASSWORD" \
+            -A -t cert -f pkcs12 \
+            -k "$KEYCHAIN_PATH"
+          security set-key-partition-list \
+            -S apple-tool:,apple: \
+            -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          # Add our keychain to the search list WITHOUT dropping the runner's existing
+          # keychains (matters on a persistent self-hosted runner). delete-keychain in the
+          # cleanup step removes it again and leaves the originals intact.
+          EXISTING=$(security list-keychains -d user | sed -E 's/^[[:space:]]*"(.*)"$/\1/')
+          security list-keychains -d user -s "$KEYCHAIN_PATH" $EXISTING
+
+      - name: Install provisioning profiles
+        env:
+          PROVISION_PROFILE_APP_BASE64: ${{ secrets.PROVISION_PROFILE_APP_BASE64 }}
+          PROVISION_PROFILE_WIDGET_BASE64: ${{ secrets.PROVISION_PROFILE_WIDGET_BASE64 }}
+        run: |
+          set -euo pipefail
+          PROFILES_DIR="$HOME/Library/MobileDevice/Provisioning Profiles"
+          mkdir -p "$PROFILES_DIR"
+
+          printf '%s' "$PROVISION_PROFILE_APP_BASE64" \
+            | base64 --decode -o "$PROFILES_DIR/nuvio_app.mobileprovision"
+
+          if [ -n "${PROVISION_PROFILE_WIDGET_BASE64:-}" ]; then
+            printf '%s' "$PROVISION_PROFILE_WIDGET_BASE64" \
+              | base64 --decode -o "$PROFILES_DIR/nuvio_widget.mobileprovision"
+          fi
+          ls -la "$PROFILES_DIR"
+
+      - name: Generate ExportOptions.plist
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          BUNDLE_ID_APP: ${{ secrets.BUNDLE_ID_APP }}
+          BUNDLE_ID_WIDGET: ${{ secrets.BUNDLE_ID_WIDGET }}
+          PROVISION_PROFILE_APP_NAME: ${{ secrets.PROVISION_PROFILE_APP_NAME }}
+          PROVISION_PROFILE_WIDGET_NAME: ${{ secrets.PROVISION_PROFILE_WIDGET_NAME }}
+          EXPORT_METHOD: ${{ inputs.export_method }}
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>method</key>
+              <string>${EXPORT_METHOD}</string>
+              <key>teamID</key>
+              <string>${APPLE_TEAM_ID}</string>
+              <key>signingStyle</key>
+              <string>manual</string>
+              <key>stripSwiftSymbols</key>
+              <true/>
+              <key>uploadBitcode</key>
+              <false/>
+              <key>uploadSymbols</key>
+              <true/>
+              <key>provisioningProfiles</key>
+              <dict>
+                  <key>${BUNDLE_ID_APP}</key>
+                  <string>${PROVISION_PROFILE_APP_NAME}</string>
+                  <key>${BUNDLE_ID_WIDGET}</key>
+                  <string>${PROVISION_PROFILE_WIDGET_NAME}</string>
+              </dict>
+          </dict>
+          </plist>
+          PLIST
+          echo "--- ExportOptions.plist ---"
+          cat "$RUNNER_TEMP/ExportOptions.plist"
+
+      - name: Read app version from Version.xcconfig
+        id: version
+        run: |
+          set -euo pipefail
+          MARKETING_VERSION=$(grep -E '^MARKETING_VERSION' iosApp/Configuration/Version.xcconfig | cut -d'=' -f2 | tr -d ' ')
+          BUILD_NUMBER=$(grep -E '^CURRENT_PROJECT_VERSION' iosApp/Configuration/Version.xcconfig | cut -d'=' -f2 | tr -d ' ')
+          echo "marketing=$MARKETING_VERSION" >> "$GITHUB_OUTPUT"
+          echo "build=$BUILD_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "Building Nuvio $MARKETING_VERSION ($BUILD_NUMBER), distribution=$NUVIO_IOS_DISTRIBUTION"
+
+      - name: Archive iOS app
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          set -o pipefail
+          xcodebuild archive \
+            -project iosApp/iosApp.xcodeproj \
+            -scheme iosApp \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination "generic/platform=iOS,name=Any iOS Device" \
+            -archivePath "$RUNNER_TEMP/Nuvio.xcarchive" \
+            -allowProvisioningUpdates \
+            DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_IDENTITY="Apple Distribution" \
+            ONLY_ACTIVE_ARCH=NO \
+            | tee "$RUNNER_TEMP/archive.log"
+
+      - name: Export IPA
+        run: |
+          set -euo pipefail
+          set -o pipefail
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/Nuvio.xcarchive" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
+            -exportPath "$RUNNER_TEMP/export" \
+            -allowProvisioningUpdates \
+            | tee "$RUNNER_TEMP/export.log"
+
+          echo "--- Export directory ---"
+          ls -la "$RUNNER_TEMP/export"
+
+      - name: Verify nuvio:// URL scheme survived
+        # Guardrail against a regression in deep-link handling: the archived app's Info.plist
+        # must still register the "nuvio" URL scheme.
+        run: |
+          set -euo pipefail
+          APP_PLIST=$(find "$RUNNER_TEMP/Nuvio.xcarchive/Products/Applications" -maxdepth 2 -name Info.plist | head -n1)
+          echo "Checking $APP_PLIST"
+          if ! /usr/libexec/PlistBuddy -c 'Print :CFBundleURLTypes' "$APP_PLIST" 2>/dev/null | grep -q 'nuvio'; then
+            echo "::error::'nuvio' URL scheme missing from the built app Info.plist." >&2
+            exit 1
+          fi
+          echo "nuvio:// scheme present."
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Nuvio-full-${{ steps.version.outputs.marketing }}-${{ steps.version.outputs.build }}
+          path: ${{ runner.temp }}/export/*.ipa
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload build logs (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/archive.log
+            ${{ runner.temp }}/export.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Upload to TestFlight
+        if: ${{ inputs.upload_testflight && success() }}
+        env:
+          APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          APP_STORE_CONNECT_API_KEY_BASE64: ${{ secrets.APP_STORE_CONNECT_API_KEY_BASE64 }}
+        run: |
+          set -euo pipefail
+          KEY_DIR="$HOME/.appstoreconnect/private_keys"
+          mkdir -p "$KEY_DIR"
+          printf '%s' "$APP_STORE_CONNECT_API_KEY_BASE64" \
+            | base64 --decode -o "$KEY_DIR/AuthKey_${APP_STORE_CONNECT_API_KEY_ID}.p8"
+
+          IPA_PATH=$(find "$RUNNER_TEMP/export" -name '*.ipa' | head -n1)
+          echo "Uploading $IPA_PATH to TestFlight..."
+
+          xcrun altool --upload-app \
+            -f "$IPA_PATH" \
+            -t ios \
+            --apiKey "$APP_STORE_CONNECT_API_KEY_ID" \
+            --apiIssuer "$APP_STORE_CONNECT_ISSUER_ID"
+
+      - name: Clean up signing artifacts
+        if: ${{ always() }}
+        run: |
+          security delete-keychain "${SIGNING_KEYCHAIN:-$RUNNER_TEMP/app-signing.keychain-db}" 2>/dev/null || true
+          rm -f "$HOME/Library/MobileDevice/Provisioning Profiles/nuvio_app.mobileprovision"
+          rm -f "$HOME/Library/MobileDevice/Provisioning Profiles/nuvio_widget.mobileprovision"
+          rm -rf "$HOME/.appstoreconnect/private_keys"
