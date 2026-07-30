@@ -272,10 +272,41 @@ jobs:
             ${{ runner.os }}-deriveddata-full-
 
       - name: Resolve Swift package dependencies (MPVKit)
+        # SwiftPM intermittently fails to download the ~40 MPVKit binaryTargets with
+        # downloadError("The Internet connection appears to be offline.") (NSURLError -1009)
+        # when resolving many zip artifacts concurrently on CI -- a known Xcode/SwiftPM bug,
+        # NOT an actual outage. Probe real connectivity first (fail fast + clearly if the
+        # runner genuinely can't reach the release host), then retry: SwiftPM reuses the
+        # artifacts it already fetched and only re-downloads the ones that failed.
         run: |
-          xcodebuild -resolvePackageDependencies \
-            -project iosApp/iosApp.xcodeproj \
-            -scheme iosApp
+          set -euo pipefail
+
+          # Fail fast with a clear message if the runner is genuinely offline, so a real
+          # network problem isn't mistaken for the flaky -1009 below.
+          if ! curl -fsSL --retry 3 --max-time 30 -o /dev/null \
+               "https://github.com/mpvkit/MPVKit/releases/latest"; then
+            echo "::error::Runner cannot reach github.com release host -- genuine connectivity failure, not the SwiftPM flake." >&2
+            exit 1
+          fi
+
+          attempt=1
+          max=5
+          until [ "$attempt" -gt "$max" ]; do
+            echo "::group::resolvePackageDependencies attempt ${attempt}/${max}"
+            if xcodebuild -resolvePackageDependencies \
+                 -project iosApp/iosApp.xcodeproj \
+                 -scheme iosApp; then
+              echo "::endgroup::"
+              echo "Resolved Swift package dependencies on attempt ${attempt}."
+              exit 0
+            fi
+            echo "::endgroup::"
+            echo "Attempt ${attempt}/${max} failed (likely SwiftPM -1009); retrying after backoff..."
+            sleep "$((attempt * 15))"
+            attempt="$((attempt + 1))"
+          done
+          echo "::error::Failed to resolve Swift package dependencies after ${max} attempts." >&2
+          exit 1
 
       - name: Import signing certificate
         env:
