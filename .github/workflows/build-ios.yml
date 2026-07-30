@@ -223,6 +223,68 @@ jobs:
             echo "::error::DEVELOPMENT_TEAM was not fully replaced." >&2; exit 1
           fi
 
+      - name: Pin manual provisioning profiles into Release configs
+        # Manual signing (forced on the xcodebuild archive line) requires each target to
+        # name its provisioning profile. A command-line PROVISIONING_PROFILE_SPECIFIER can't
+        # be used because the app and widget need DIFFERENT profiles, and CLI build settings
+        # apply to every target at once. So write the profile name into each target's Release
+        # buildSettings, matched by the (already fork-rewritten) bundle identifier.
+        env:
+          BUNDLE_ID_APP: ${{ secrets.BUNDLE_ID_APP }}
+          BUNDLE_ID_WIDGET: ${{ secrets.BUNDLE_ID_WIDGET }}
+          PROVISION_PROFILE_APP_NAME: ${{ secrets.PROVISION_PROFILE_APP_NAME }}
+          PROVISION_PROFILE_WIDGET_NAME: ${{ secrets.PROVISION_PROFILE_WIDGET_NAME }}
+        run: |
+          set -euo pipefail
+          for v in BUNDLE_ID_APP BUNDLE_ID_WIDGET PROVISION_PROFILE_APP_NAME PROVISION_PROFILE_WIDGET_NAME; do
+            if [ -z "${!v:-}" ]; then echo "::error::$v secret is not set." >&2; exit 1; fi
+          done
+          python3 - <<'PY'
+          import os, re, sys
+          path = "iosApp/iosApp.xcodeproj/project.pbxproj"
+          app_id     = os.environ["BUNDLE_ID_APP"]
+          widget_id  = os.environ["BUNDLE_ID_WIDGET"]
+          app_prof   = os.environ["PROVISION_PROFILE_APP_NAME"]
+          widget_prof= os.environ["PROVISION_PROFILE_WIDGET_NAME"]
+
+          with open(path) as f:
+              text = f.read()
+
+          # A buildSettings block holds only "key = value;" / "key = ( ... );" lines -- no
+          # nested "{ }" -- so it runs from "buildSettings = {" to the first "\n<tabs>};".
+          block_re = re.compile(r'buildSettings = \{.*?\n(\t+)\};', re.DOTALL)
+          patched = []
+
+          def patch(m):
+              block  = m.group(0)
+              indent = m.group(1) + "\t"  # settings sit one tab deeper than the closing brace
+              if re.search(r'PRODUCT_BUNDLE_IDENTIFIER = ' + re.escape(widget_id) + r';', block):
+                  prof = widget_prof
+              elif re.search(r'PRODUCT_BUNDLE_IDENTIFIER = ' + re.escape(app_id) + r';', block):
+                  prof = app_prof
+              else:
+                  return block
+              block = re.sub(r'CODE_SIGN_STYLE = \w+;', 'CODE_SIGN_STYLE = Manual;', block)
+              block = re.sub(r'CODE_SIGN_IDENTITY = "[^"]*";', 'CODE_SIGN_IDENTITY = "Apple Distribution";', block)
+              if 'PROVISIONING_PROFILE_SPECIFIER' not in block:
+                  block = block.replace(
+                      'buildSettings = {\n',
+                      'buildSettings = {\n' + indent + 'PROVISIONING_PROFILE_SPECIFIER = "' + prof + '";\n',
+                      1)
+              patched.append(prof)
+              return block
+
+          new_text = block_re.sub(patch, text)
+          if len(patched) != 2:
+              sys.exit(f"FAIL: expected to patch 2 Release configs (app + widget), patched {len(patched)}: {patched}")
+          with open(path, "w") as f:
+              f.write(new_text)
+          print("Pinned provisioning profiles:", patched)
+          PY
+
+          echo "--- Provisioning specifiers after patch ---"
+          grep -nE 'PROVISIONING_PROFILE_SPECIFIER = ' iosApp/iosApp.xcodeproj/project.pbxproj
+
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
