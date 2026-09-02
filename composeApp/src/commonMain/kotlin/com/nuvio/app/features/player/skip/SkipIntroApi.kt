@@ -9,7 +9,6 @@ internal object SkipIntroApi {
     private val json = Json { ignoreUnknownKeys = true; isLenient = true }
 
     private const val ANISKIP_BASE = "https://api.aniskip.com/v2/"
-    private const val ARM_BASE = "https://arm.haglund.dev/api/v2/"
     private const val ANIMESKIP_BASE = "https://api.anime-skip.com/"
 
     // --- IntroDb ---
@@ -92,73 +91,11 @@ internal object SkipIntroApi {
         malId: String,
         episode: Int,
     ): AniSkipResponse? {
-        val types = "op,ed,recap,mixed-op,mixed-ed"
-        val url = "${ANISKIP_BASE}skip-times/$malId/$episode?types=$types&episodeLength=0"
+        val types = "types=op&types=ed&types=recap&types=mixed-op&types=mixed-ed"
+        val url = "${ANISKIP_BASE}skip-times/$malId/$episode?$types&episodeLength=0"
         return try {
             val text = httpGetText(url)
             json.decodeFromString<AniSkipResponse>(text)
-        } catch (_: Exception) {
-            null
-        }
-    }
-
-    // --- ARM API (ID resolution) ---
-
-    suspend fun resolveImdbToAll(imdbId: String): List<ArmEntry> {
-        val url = "${ARM_BASE}imdb?id=$imdbId&include=myanimelist,anilist,kitsu"
-        return try {
-            val text = httpGetText(url)
-            json.decodeFromString<List<ArmEntry>>(text)
-        } catch (_: Exception) {
-            emptyList()
-        }
-    }
-
-    suspend fun resolveMalToImdb(malId: String): ArmEntry? {
-        val url = "${ARM_BASE}ids?source=myanimelist&id=$malId&include=imdb"
-        return try {
-            val text = httpGetText(url)
-            json.decodeFromString<ArmEntry>(text)
-        } catch (_: Exception) {
-            null
-        }
-    }
-
-    suspend fun resolveMalToAnilist(malId: String): ArmEntry? {
-        val url = "${ARM_BASE}ids?source=myanimelist&id=$malId&include=anilist"
-        return try {
-            val text = httpGetText(url)
-            json.decodeFromString<ArmEntry>(text)
-        } catch (_: Exception) {
-            null
-        }
-    }
-
-    suspend fun resolveKitsuToMal(kitsuId: String): ArmEntry? {
-        val url = "${ARM_BASE}ids?source=kitsu&id=$kitsuId&include=myanimelist"
-        return try {
-            val text = httpGetText(url)
-            json.decodeFromString<ArmEntry>(text)
-        } catch (_: Exception) {
-            null
-        }
-    }
-
-    suspend fun resolveKitsuToAnilist(kitsuId: String): ArmEntry? {
-        val url = "${ARM_BASE}ids?source=kitsu&id=$kitsuId&include=anilist"
-        return try {
-            val text = httpGetText(url)
-            json.decodeFromString<ArmEntry>(text)
-        } catch (_: Exception) {
-            null
-        }
-    }
-
-    suspend fun resolveKitsuToImdb(kitsuId: String): ArmEntry? {
-        val url = "${ARM_BASE}ids?source=kitsu&id=$kitsuId&include=imdb"
-        return try {
-            val text = httpGetText(url)
-            json.decodeFromString<ArmEntry>(text)
         } catch (_: Exception) {
             null
         }
